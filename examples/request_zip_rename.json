@@ -1,0 +1,29 @@
+{
+  "sources": [
+    {
+      "name": "waybills",
+      "columns": ["waybill_id", "receiver_zip_old", "city_id", "weight_kg", "ts"]
+    },
+    {
+      "name": "dim_delivery_zone",
+      "columns": ["zone_id", "zip_code", "zone_name"]
+    }
+  ],
+  "models": [
+    {
+      "name": "stg_waybill",
+      "sql": "WITH cleaned AS (\n  SELECT waybill_id,\n         receiver_zip_old AS zip,\n         city_id,\n         weight_kg\n  FROM waybills\n  WHERE receiver_zip_old IS NOT NULL\n)\nSELECT waybill_id, zip, city_id, weight_kg\nFROM cleaned"
+    },
+    {
+      "name": "dwd_delivery_fact",
+      "sql": "SELECT s.waybill_id,\n       s.zip AS receiver_zip,\n       z.zone_name,\n       s.weight_kg * 1000 AS weight_g\nFROM stg_waybill s\nJOIN dim_delivery_zone z ON s.zip = z.zip_code\nWHERE s.zip LIKE '10%'"
+    },
+    {
+      "name": "ads_zip_filtered",
+      "sql": "SELECT receiver_zip,\n       zone_name,\n       weight_g\nFROM dwd_delivery_fact\nWHERE receiver_zip IN ('100000', '100001')"
+    }
+  ],
+  "targets": [
+    { "table": "waybills", "column": "receiver_zip_old" }
+  ]
+}
