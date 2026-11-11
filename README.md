@@ -13,6 +13,11 @@
 - 别名：`receiver_zip_old AS zip` 会把依赖从 `zip` 继续追到源列。
 - 普通星号：`SELECT *`、`SELECT t.*` 按关系实际输出列展开；支持
   `* EXCLUDE (...)`（DuckDB 里 `EXCEPT` 同义）与 `* REPLACE (...)`。
+- `JOIN ... USING (key)`：连接键合并为单列。未限定的连接键引用与 `SELECT *`
+  按合并后的列分析（`SELECT *` 中只出现一次）；带表名/别名的 `t.key` 与 `t.*`
+  仍从对应关系取列。INNER/LEFT 的合并键沿用当时左侧的血缘，RIGHT 沿用右侧，
+  FULL 追溯两侧。连续连接时每段 USING 只追当时左侧结果与本次右表的连接键，
+  后续表的同名列不会计入之前的连接条件。合并键经 CTE 或下游模型时引用链不断。
 - 非递归 CTE：CTE 可引用同模型内更早的 CTE，作用域链以 `模型.CTE.列` 呈现。
 - 跨模型：模型可以引用其他模型的输出列，分析按依赖拓扑顺序进行，链上保留模型跳。
 - 名称匹配大小写不敏感，源表可带 catalog/schema 前缀（按表名匹配）。
@@ -29,6 +34,7 @@
 
 - 列在当前查询所有关系中都不存在；
 - 未限定的列名可由多个关系提供（歧义，要求加表别名）；
+- `JOIN USING` 的连接键在左侧结果或右表中不存在，或在左侧结果中有歧义；
 - 表别名不存在、表/CTE 未定义、输出列重名等。
 
 ## 启动（Docker Compose）
@@ -40,7 +46,10 @@ docker compose up --build
 # OpenAPI: http://localhost:8000/openapi.json
 ```
 
-Swagger 的 `POST /analyze` 请求体自带"邮编改名后仍用于筛选"的样例，可直接 Try it out。
+Swagger 的 `POST /analyze` 请求体自带"旧邮编改名后经连续 `JOIN USING` 连接、
+仍用于筛选"的样例（`stg_waybill` → `dwd_delivery_fact` 中
+`JOIN dim_delivery_zone USING (zip) JOIN dim_route USING (zone_id)`），
+可直接 Try it out 提交。
 
 ## 请求示例
 
@@ -106,7 +115,7 @@ curl -X POST http://localhost:8000/analyze \
 python -m venv --without-pip .venv   # 若系统带 ensurepip 可直接 python -m venv .venv
 .venv/bin/pip install -r requirements.txt
 PYTHONPATH=. .venv/bin/uvicorn app.main:app --reload
-.venv/bin/pytest                       # 37 个测试
+.venv/bin/pytest                       # 51 个测试
 ```
 
 ## 目录

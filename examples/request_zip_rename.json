@@ -2,11 +2,15 @@
   "sources": [
     {
       "name": "waybills",
-      "columns": ["waybill_id", "receiver_zip_old", "city_id", "weight_kg", "ts"]
+      "columns": ["waybill_id", "receiver_zip_old", "city_id", "weight_kg"]
     },
     {
       "name": "dim_delivery_zone",
-      "columns": ["zone_id", "zip_code", "zone_name"]
+      "columns": ["zone_id", "zip", "zone_name"]
+    },
+    {
+      "name": "dim_route",
+      "columns": ["route_id", "zone_id", "route_name"]
     }
   ],
   "models": [
@@ -16,7 +20,7 @@
     },
     {
       "name": "dwd_delivery_fact",
-      "sql": "SELECT s.waybill_id,\n       s.zip AS receiver_zip,\n       z.zone_name,\n       s.weight_kg * 1000 AS weight_g\nFROM stg_waybill s\nJOIN dim_delivery_zone z ON s.zip = z.zip_code\nWHERE s.zip LIKE '10%'"
+      "sql": "SELECT s.waybill_id,\n       zip AS receiver_zip,\n       z.zone_name,\n       r.route_name,\n       s.weight_kg * 1000 AS weight_g\nFROM stg_waybill s\nJOIN dim_delivery_zone z USING (zip)\nJOIN dim_route r USING (zone_id)\nWHERE zip LIKE '10%'"
     },
     {
       "name": "ads_zip_filtered",

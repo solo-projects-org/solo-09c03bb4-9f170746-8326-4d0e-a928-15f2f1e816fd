@@ -12,10 +12,12 @@ app = FastAPI(
     title="配送数仓列依赖分析服务",
     description=(
         "基于 SQLGlot 解析（不执行 SQL），沿别名、普通星号与非递归 CTE 跨模型追踪"
-        "待下线源列的引用，按模型输出依赖该列的输出列以及 WHERE / JOIN ON 条件，"
-        "每项附引用链。不支持聚合、集合运算与 CTE 之外的子查询。"
+        "待下线源列的引用，按模型输出依赖该列的输出列以及 WHERE / JOIN ON / JOIN USING /"
+        " QUALIFY 条件，每项附引用链。JOIN USING 的连接键按合并后的单列分析："
+        "INNER/LEFT 沿用当时左侧血缘，FULL 追溯两侧；连续连接时每段 USING 只追"
+        "当时左侧结果与本次右表。不支持聚合、集合运算与 CTE 之外的子查询。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -54,7 +56,11 @@ class AnalyzeRequest(BaseModel):
                         },
                         {
                             "name": "dim_delivery_zone",
-                            "columns": ["zone_id", "zip_code", "zone_name"],
+                            "columns": ["zone_id", "zip", "zone_name"],
+                        },
+                        {
+                            "name": "dim_route",
+                            "columns": ["route_id", "zone_id", "route_name"],
                         },
                     ],
                     "models": [
@@ -62,11 +68,11 @@ class AnalyzeRequest(BaseModel):
                             "name": "stg_waybill",
                             "sql": (
                                 "WITH cleaned AS (\n"
-                                "  SELECT waybill_id, receiver_zip_old AS zip, city_id\n"
+                                "  SELECT waybill_id, receiver_zip_old AS zip, city_id, weight_kg\n"
                                 "  FROM waybills\n"
                                 "  WHERE receiver_zip_old IS NOT NULL\n"
                                 ")\n"
-                                "SELECT waybill_id, zip, city_id\n"
+                                "SELECT waybill_id, zip, city_id, weight_kg\n"
                                 "FROM cleaned"
                             ),
                         },
@@ -74,12 +80,22 @@ class AnalyzeRequest(BaseModel):
                             "name": "dwd_delivery_fact",
                             "sql": (
                                 "SELECT s.waybill_id,\n"
-                                "       s.zip AS receiver_zip,\n"
+                                "       zip AS receiver_zip,\n"
                                 "       z.zone_name,\n"
+                                "       r.route_name,\n"
                                 "       s.weight_kg * 1000 AS weight_g\n"
                                 "FROM stg_waybill s\n"
-                                "JOIN dim_delivery_zone z ON s.zip = z.zip_code\n"
-                                "WHERE s.zip LIKE '10%'"
+                                "JOIN dim_delivery_zone z USING (zip)\n"
+                                "JOIN dim_route r USING (zone_id)\n"
+                                "WHERE zip LIKE '10%'"
+                            ),
+                        },
+                        {
+                            "name": "ads_zip_filtered",
+                            "sql": (
+                                "SELECT receiver_zip, zone_name, weight_g\n"
+                                "FROM dwd_delivery_fact\n"
+                                "WHERE receiver_zip IN ('100000', '100001')"
                             ),
                         },
                     ],

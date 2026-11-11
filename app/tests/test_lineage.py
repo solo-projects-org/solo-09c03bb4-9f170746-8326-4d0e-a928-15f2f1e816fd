@@ -297,6 +297,194 @@ def test_using_join_condition_is_tracked():
     assert conds[0]["reference_chain"][-1] == "waybills.receiver_zip_old"
 
 
+# Both relations expose the (old) zip column so JOIN USING can merge it.
+ZIP_SOURCES = {
+    "waybills": ["waybill_id", "receiver_zip_old", "city_id", "route_id"],
+    "dim_delivery_zone": ["zone_id", "receiver_zip_old", "zone_name"],
+}
+BOTH_ZIP_TARGETS = [("waybills", "receiver_zip_old"),
+                    ("dim_delivery_zone", "receiver_zip_old")]
+
+
+def test_using_unqualified_key_resolves_merged_not_ambiguous():
+    result = analyze({
+        "m": ("SELECT receiver_zip_old FROM waybills w"
+              " JOIN dim_delivery_zone d USING (receiver_zip_old)"),
+    }, sources=ZIP_SOURCES)
+    # INNER: the merged key keeps the left side's lineage
+    assert chain_sets(result, "m", "receiver_zip_old") == {
+        ("m.receiver_zip_old", "waybills.receiver_zip_old"),
+    }
+
+
+def test_using_star_expands_merged_key_once():
+    result = analyze({
+        "m": ("SELECT * FROM waybills w"
+              " JOIN dim_delivery_zone d USING (receiver_zip_old)"),
+    }, sources=ZIP_SOURCES)
+    # no duplicate-output error; the merged key appears exactly once
+    assert {e["output_column"] for e in result["m"]["dependent_output_columns"]} == {
+        "receiver_zip_old"}
+    assert chain_sets(result, "m", "receiver_zip_old") == {
+        ("m.receiver_zip_old", "waybills.receiver_zip_old"),
+    }
+
+
+def test_using_qualified_column_and_star_stay_per_relation():
+    result = analyze({
+        "m": ("SELECT w.receiver_zip_old AS w_zip, d.receiver_zip_old AS d_zip"
+              " FROM waybills w JOIN dim_delivery_zone d USING (receiver_zip_old)"),
+    }, sources=ZIP_SOURCES)
+    # qualified columns read the key from their own relation, not the merged one
+    assert chain_sets(result, "m", "w_zip") == {("m.w_zip", "waybills.receiver_zip_old")}
+    assert chain_sets(result, "m", "d_zip") == set()
+    result = analyze({
+        "m": ("SELECT d.* FROM waybills w"
+              " JOIN dim_delivery_zone d USING (receiver_zip_old)"),
+    }, sources=ZIP_SOURCES, targets=[("dim_delivery_zone", "receiver_zip_old")])
+    # qualified star expands the right relation's own key column
+    assert chain_sets(result, "m", "receiver_zip_old") == {
+        ("m.receiver_zip_old", "dim_delivery_zone.receiver_zip_old"),
+    }
+
+
+def test_using_left_join_merged_key_keeps_left_lineage():
+    result = analyze({
+        "m": ("SELECT receiver_zip_old, w.receiver_zip_old AS w_zip"
+              " FROM dim_delivery_zone d LEFT JOIN waybills w"
+              " USING (receiver_zip_old)"),
+    }, sources=ZIP_SOURCES)
+    # target sits on the right; the LEFT-merged key follows the left side
+    assert chain_sets(result, "m", "receiver_zip_old") == set()
+    assert chain_sets(result, "m", "w_zip") == {("m.w_zip", "waybills.receiver_zip_old")}
+    # the USING condition still traces the equated key on each side
+    using = [c for c in result["m"]["filter_conditions"] if c["type"] == "JOIN USING"]
+    assert len(using) == 1
+    assert using[0]["reference_chain"] == ["waybills.receiver_zip_old"]
+
+
+def test_using_full_join_merged_key_traces_both_sides():
+    result = analyze({
+        "m": ("SELECT receiver_zip_old FROM waybills w"
+              " FULL OUTER JOIN dim_delivery_zone d USING (receiver_zip_old)"),
+    }, sources=ZIP_SOURCES, targets=BOTH_ZIP_TARGETS)
+    assert chain_sets(result, "m", "receiver_zip_old") == {
+        ("m.receiver_zip_old", "waybills.receiver_zip_old"),
+        ("m.receiver_zip_old", "dim_delivery_zone.receiver_zip_old"),
+    }
+
+
+def test_using_full_merged_key_chain_survives_cte_and_model():
+    result = analyze({
+        "m1": ("WITH j AS (SELECT receiver_zip_old FROM waybills w"
+               " FULL OUTER JOIN dim_delivery_zone d USING (receiver_zip_old))"
+               " SELECT receiver_zip_old AS zip FROM j"),
+        "m2": "SELECT zip AS receiver_zip FROM m1",
+    }, sources=ZIP_SOURCES, targets=BOTH_ZIP_TARGETS)
+    assert chain_sets(result, "m1", "zip") == {
+        ("m1.zip", "m1.j.receiver_zip_old", "waybills.receiver_zip_old"),
+        ("m1.zip", "m1.j.receiver_zip_old", "dim_delivery_zone.receiver_zip_old"),
+    }
+    assert chain_sets(result, "m2", "receiver_zip") == {
+        ("m2.receiver_zip", "m1.zip", "m1.j.receiver_zip_old",
+         "waybills.receiver_zip_old"),
+        ("m2.receiver_zip", "m1.zip", "m1.j.receiver_zip_old",
+         "dim_delivery_zone.receiver_zip_old"),
+    }
+
+
+def test_using_merged_key_chain_survives_cte_and_downstream_model():
+    result = analyze({
+        "stg": ("WITH j AS (SELECT receiver_zip_old, zone_name FROM waybills w"
+                " JOIN dim_delivery_zone d USING (receiver_zip_old))"
+                " SELECT receiver_zip_old AS zip, zone_name FROM j"),
+        "dwd": "SELECT zip AS receiver_zip FROM stg",
+    }, sources=ZIP_SOURCES)
+    assert chain_sets(result, "dwd", "receiver_zip") == {
+        ("dwd.receiver_zip", "stg.zip", "stg.j.receiver_zip_old",
+         "waybills.receiver_zip_old"),
+    }
+
+
+def test_using_consecutive_joins_keep_conditions_isolated():
+    result = analyze({
+        "m": ("WITH r AS (SELECT receiver_zip_old, route_id FROM waybills)"
+              " SELECT w.waybill_id FROM waybills w"
+              " JOIN dim_delivery_zone d USING (receiver_zip_old)"
+              " JOIN r USING (route_id)"),
+    }, sources=ZIP_SOURCES)
+    conds = result["m"]["filter_conditions"]
+    # the later CTE's zip must not leak into the first join's USING, and
+    # route_id is not a target: exactly one condition remains
+    assert len(conds) == 1
+    assert conds[0]["type"] == "JOIN USING"
+    assert "USING (receiver_zip_old)" in conds[0]["expression"]
+    assert conds[0]["reference_chain"] == ["waybills.receiver_zip_old"]
+
+
+def test_using_second_join_tracks_left_result_and_own_right_table():
+    result = analyze({
+        "m": ("SELECT w.waybill_id FROM waybills w"
+              " JOIN dim_delivery_zone d USING (receiver_zip_old)"
+              " JOIN waybills w2 USING (receiver_zip_old)"),
+    }, sources=ZIP_SOURCES, targets=BOTH_ZIP_TARGETS)
+    conds = result["m"]["filter_conditions"]
+    first = [c for c in conds if "dim_delivery_zone" in c["expression"]]
+    # first join equates w.receiver_zip_old with d.receiver_zip_old only
+    assert {tuple(c["reference_chain"]) for c in first} == {
+        ("waybills.receiver_zip_old",),
+        ("dim_delivery_zone.receiver_zip_old",),
+    }
+    second = [c for c in conds if "w2" in c["expression"]]
+    # second join: merged left key (INNER -> waybills side) + w2's own key;
+    # dim's key must not be re-attributed to this condition
+    assert len(second) == 2
+    assert {tuple(c["reference_chain"]) for c in second} == {
+        ("waybills.receiver_zip_old",)}
+
+
+def test_using_condition_not_counted_as_output():
+    result = analyze({
+        "m": ("SELECT w.waybill_id FROM waybills w"
+              " JOIN dim_delivery_zone d USING (receiver_zip_old)"),
+    }, sources=ZIP_SOURCES)
+    assert result["m"]["dependent_output_columns"] == []
+    assert [c["type"] for c in result["m"]["filter_conditions"]] == ["JOIN USING"]
+
+
+def test_using_key_missing_on_right_rejected():
+    with pytest.raises(AggregatedAnalysisError) as exc:
+        # default dim_delivery_zone has zip_code, not receiver_zip_old
+        analyze({
+            "m": ("SELECT * FROM waybills w"
+                  " JOIN dim_delivery_zone d USING (receiver_zip_old)"),
+        })
+    assert exc.value.errors[0].model == "m"
+    assert "连接键" in str(exc.value)
+
+
+def test_using_key_missing_on_left_rejected():
+    with pytest.raises(AggregatedAnalysisError) as exc:
+        # default dim_delivery_zone has zip_code, not receiver_zip_old
+        analyze({
+            "m": ("SELECT * FROM dim_delivery_zone d"
+                  " JOIN waybills w USING (receiver_zip_old)"),
+        })
+    assert exc.value.errors[0].model == "m"
+    assert "左侧" in str(exc.value)
+
+
+def test_using_key_ambiguous_on_left_rejected():
+    with pytest.raises(AggregatedAnalysisError) as exc:
+        analyze({
+            "m": ("SELECT * FROM waybills a"
+                  " JOIN waybills b ON a.waybill_id = b.waybill_id"
+                  " JOIN dim_delivery_zone d USING (receiver_zip_old)"),
+        })
+    assert exc.value.errors[0].model == "m"
+    assert "歧义" in str(exc.value)
+
+
 def test_natural_join_rejected():
     with pytest.raises(AggregatedAnalysisError) as exc:
         analyze({

@@ -3,6 +3,15 @@
 Only sqlglot parsing is used; SQL is never executed. The analyzer follows
 column references across aliases, plain stars (including ``* EXCLUDE`` /
 ``* REPLACE``) and non-recursive CTEs, across multiple models.
+
+``JOIN ... USING (key)`` merges the join key into a single column: unqualified
+references and plain ``SELECT *`` see the merged key once, while qualified
+references (``t.key``) and qualified stars (``t.*``) still read the key from
+their own relation. For INNER/LEFT joins the merged key keeps the lineage of
+the left side at that point in the join chain; for RIGHT joins the right side;
+for FULL joins both sides are traced. Each USING clause is evaluated against
+the left result available at that join step plus the current right table only,
+so keys of tables joined later never leak into earlier join conditions.
 """
 from __future__ import annotations
 
@@ -40,6 +49,10 @@ class ColumnNode:
     is_source: bool = False
     source_table: Optional[str] = None
     source_column: Optional[str] = None
+    # True for the synthetic merged key of a FULL JOIN ... USING: it already
+    # lives in the current scope, so projections of it reuse it directly
+    # instead of wrapping it in a same-labelled node.
+    is_join_merge: bool = False
 
     def label(self) -> str:
         if self.is_source:
@@ -79,6 +92,23 @@ class Relation:
     binding: str                      # alias if present else relation name (lower-cased)
     display: str                      # original spelling for messages
     columns: dict[str, ColumnNode]    # lower-cased column name -> node
+
+
+@dataclass
+class ViewColumn:
+    """One column visible without a table qualifier in a FROM/JOIN chain."""
+
+    key: str           # lower-cased visible column name
+    node: ColumnNode
+    origin: str        # providing relation display (scope id for FULL-merged keys)
+
+
+@dataclass
+class FromScope:
+    """Qualified relations plus the merged unqualified column view."""
+
+    relations: list[Relation]   # for t.col / t.* lookups
+    view: list[ViewColumn]      # JOIN USING keys merged, duplicates kept for ambiguity checks
 
 
 def _norm(value: Optional[str]) -> str:
@@ -250,13 +280,23 @@ class Analyzer:
         return Relation(binding=binding, display=table.sql(DIALECT),
                         columns=dict(scope))
 
-    def _build_relations(self, scope_id: str, select: exp.Select,
-                         cte_scopes: dict[str, tuple[str, dict[str, ColumnNode]]],
-                         model: str) -> list[Relation]:
+    # ----------------------------------------------------------- FROM/JOIN scope
+    def _build_from_scope(
+        self, scope_id: str, select: exp.Select,
+        cte_scopes: dict[str, tuple[str, dict[str, ColumnNode]]],
+        model: str,
+    ) -> tuple[FromScope, list[list[tuple[str, ColumnNode]]]]:
+        """Build relations plus the merged unqualified view for one SELECT.
+
+        Returns the FromScope and, aligned with ``select.args['joins']``, the
+        JOIN USING key columns to record as conditions: for each USING clause
+        exactly the left result's key at that join step and the current right
+        table's key — never keys of tables joined earlier or later.
+        """
         relations: list[Relation] = []
         bindings: set[str] = set()
 
-        def add_relation(table: exp.Table) -> None:
+        def make_relation(table: exp.Table) -> Relation:
             tkey = _norm(table.name)
             alias = _norm(table.alias)
             binding = alias or tkey
@@ -284,28 +324,102 @@ class Analyzer:
                     location=table.sql(DIALECT))
             bindings.add(binding)
             relations.append(relation)
+            return relation
 
         from_node = select.args.get("from_")
         if from_node is None or not isinstance(from_node.this, exp.Table):
             raise AnalysisError("FROM 子句缺失或不是普通表", model=model)
-        add_relation(from_node.this)
+        from_rel = make_relation(from_node.this)
+        view: list[ViewColumn] = [
+            ViewColumn(key=key, node=node, origin=from_rel.display)
+            for key, node in from_rel.columns.items()
+        ]
+        left_display = from_rel.display
+
+        using_records: list[list[tuple[str, ColumnNode]]] = []
         for join in select.args.get("joins") or []:
             target = join.this
             if not isinstance(target, exp.Table):
                 raise AnalysisError(
                     "JOIN 目标不是普通表（子查询/LATERAL 等不支持）",
                     model=model, location=target.sql(DIALECT))
-            add_relation(target)
-        return relations
+            right_rel = make_relation(target)
+            records: list[tuple[str, ColumnNode]] = []
+            using_idents = join.args.get("using") or []
+            if using_idents:
+                side = str(join.args.get("side") or "").upper()
+                merged: dict[str, ViewColumn] = {}
+                for ident in using_idents:
+                    col_name = ident.name if isinstance(ident, exp.Identifier) else str(ident)
+                    key = _norm(col_name)
+                    left_matches = [vc for vc in view if vc.key == key]
+                    if not left_matches:
+                        raise AnalysisError(
+                            f"JOIN USING 的连接键 {col_name} 在左侧结果中找不到",
+                            model=model, location=join.sql(DIALECT))
+                    if len(left_matches) > 1:
+                        where = ", ".join(vc.origin for vc in left_matches)
+                        raise AnalysisError(
+                            f"JOIN USING 的连接键 {col_name} 在左侧结果中存在歧义，"
+                            f"可来自: {where}",
+                            model=model, location=join.sql(DIALECT))
+                    left_entry = left_matches[0]
+                    right_node = right_rel.columns.get(key)
+                    if right_node is None:
+                        available = ", ".join(
+                            sorted(n.output_name for n in right_rel.columns.values()))
+                        raise AnalysisError(
+                            f"JOIN USING 的连接键 {col_name} 在关系 "
+                            f"{right_rel.display} 中找不到，可用列: {available}",
+                            model=model, location=join.sql(DIALECT))
+                    # this USING clause equates exactly these two key columns
+                    records.append((f"{left_display}.{col_name}", left_entry.node))
+                    records.append((f"{right_rel.display}.{col_name}", right_node))
+                    if side == "FULL":
+                        # FULL: the merged key may come from either side
+                        merged_node = ColumnNode(
+                            scope_id=scope_id, output_name=col_name,
+                            expression_sql=f"USING ({col_name})",
+                            parents=[left_entry.node, right_node],
+                            is_join_merge=True)
+                        merged[key] = ViewColumn(key=key, node=merged_node,
+                                                 origin=scope_id)
+                    elif side == "RIGHT":
+                        # RIGHT: every right row survives, merged key == right key
+                        merged[key] = ViewColumn(key=key, node=right_node,
+                                                 origin=right_rel.display)
+                    else:
+                        # INNER/LEFT: merged key keeps the left side's lineage
+                        merged[key] = ViewColumn(key=key, node=left_entry.node,
+                                                 origin=left_entry.origin)
+                using_keys = set(merged)
+                # DuckDB exposes merged USING keys first, then the remaining
+                # left columns, then the remaining right columns
+                new_view = list(merged.values())
+                new_view.extend(vc for vc in view if vc.key not in using_keys)
+                new_view.extend(
+                    ViewColumn(key=key, node=node, origin=right_rel.display)
+                    for key, node in right_rel.columns.items()
+                    if key not in using_keys
+                )
+                view = new_view
+            else:
+                view.extend(
+                    ViewColumn(key=key, node=node, origin=right_rel.display)
+                    for key, node in right_rel.columns.items()
+                )
+            left_display = scope_id
+            using_records.append(records)
+        return FromScope(relations=relations, view=view), using_records
 
     # --------------------------------------------------------- column resolution
-    def _resolve_column(self, column: exp.Column, relations: list[Relation],
+    def _resolve_column(self, column: exp.Column, from_scope: FromScope,
                         model: str) -> ColumnNode:
         col_name = column.name
         col_key = _norm(col_name)
         table_qualifier = _norm(column.table)
         if table_qualifier:
-            matches = [r for r in relations if r.binding == table_qualifier]
+            matches = [r for r in from_scope.relations if r.binding == table_qualifier]
             if not matches:
                 raise AnalysisError(
                     f"列 {column.sql(DIALECT)} 引用的别名/表 {column.table} 不在当前查询中",
@@ -318,22 +432,22 @@ class Analyzer:
                     f"关系 {relation.display} 中找不到列 {col_name}，可用列: {available}",
                     model=model, location=column.sql(DIALECT))
             return node
-        candidates = [r for r in relations if col_key in r.columns]
+        candidates = [vc for vc in from_scope.view if vc.key == col_key]
         if not candidates:
             raise AnalysisError(
                 f"找不到列 {col_name}", model=model, location=column.sql(DIALECT))
         if len(candidates) > 1:
-            where = ", ".join(r.display for r in candidates)
+            where = ", ".join(vc.origin for vc in candidates)
             raise AnalysisError(
                 f"列 {col_name} 存在歧义，可来自: {where}，请加表别名限定",
                 model=model, location=column.sql(DIALECT))
-        return candidates[0].columns[col_key]
+        return candidates[0].node
 
-    def _resolve_expression(self, node: exp.Expression, relations: list[Relation],
+    def _resolve_expression(self, node: exp.Expression, from_scope: FromScope,
                             model: str) -> list[ColumnNode]:
         parents: list[ColumnNode] = []
         for column in node.find_all(exp.Column):
-            resolved = self._resolve_column(column, relations, model)
+            resolved = self._resolve_column(column, from_scope, model)
             if resolved not in parents:
                 parents.append(resolved)
         return parents
@@ -346,7 +460,7 @@ class Analyzer:
         inner = star.this
         return inner if isinstance(inner, exp.Star) else exp.Star()
 
-    def _expand_star(self, star: exp.Expression, relations: list[Relation],
+    def _expand_star(self, star: exp.Expression, from_scope: FromScope,
                      output: dict[str, ColumnNode], ordered_names: list[str],
                      scope_id: str, model: str) -> None:
         spec = self._star_spec(star)
@@ -354,48 +468,56 @@ class Analyzer:
                     for e in (spec.args.get("except_") or [])}
         replaces = spec.args.get("replace") or []
         if isinstance(star, exp.Column) and star.is_star:
-            target_relations = [r for r in relations if r.binding == _norm(star.table)]
+            # qualified star (t.*) reads columns from its own relation only
+            target_relations = [r for r in from_scope.relations
+                                if r.binding == _norm(star.table)]
             if not target_relations:
                 raise AnalysisError(
                     f"星号 {star.sql(DIALECT)} 引用的别名 {star.table} 不在当前查询中",
                     model=model, location=star.sql(DIALECT))
+            items = [(key, node) for relation in target_relations
+                     for key, node in relation.columns.items()]
         else:
-            target_relations = relations
-        for relation in target_relations:
-            for key, source_node in relation.columns.items():
-                if key in excludes:
-                    continue
-                name = source_node.output_name
-                out_key = _norm(name)
-                if out_key in output:
-                    raise AnalysisError(
-                        f"星号展开后输出列 {name} 与已有输出列重名，请显式处理",
-                        model=model, location=star.sql(DIALECT))
-                replace_match = next(
-                    (r for r in replaces
-                     if _norm(r.this.name if isinstance(r.this, exp.Column) else r.this.name) == key),
-                    None)
-                if replace_match is not None:
-                    expr = replace_match.this
-                    parents = self._resolve_expression(expr, relations, model)
-                    alias = replace_match.alias or name
-                    node = ColumnNode(
-                        scope_id=scope_id, output_name=alias,
-                        expression_sql=expr.sql(DIALECT), parents=parents)
-                else:
-                    node = ColumnNode(
-                        scope_id=scope_id, output_name=name,
-                        expression_sql=source_node.expression_sql,
-                        parents=[source_node])
-                output[_norm(node.output_name)] = node
-                ordered_names.append(node.output_name)
+            # plain star sees JOIN USING keys once, as merged columns
+            items = [(vc.key, vc.node) for vc in from_scope.view]
+        for key, source_node in items:
+            if key in excludes:
+                continue
+            name = source_node.output_name
+            out_key = _norm(name)
+            if out_key in output:
+                raise AnalysisError(
+                    f"星号展开后输出列 {name} 与已有输出列重名，请显式处理",
+                    model=model, location=star.sql(DIALECT))
+            replace_match = next(
+                (r for r in replaces
+                 if _norm(r.this.name if isinstance(r.this, exp.Column) else r.this.name) == key),
+                None)
+            if replace_match is not None:
+                expr = replace_match.this
+                parents = self._resolve_expression(expr, from_scope, model)
+                alias = replace_match.alias or name
+                node = ColumnNode(
+                    scope_id=scope_id, output_name=alias,
+                    expression_sql=expr.sql(DIALECT), parents=parents)
+            elif source_node.is_join_merge:
+                # merged FULL JOIN USING key: expose it as-is so the chain
+                # does not gain a same-labelled hop
+                node = source_node
+            else:
+                node = ColumnNode(
+                    scope_id=scope_id, output_name=name,
+                    expression_sql=source_node.expression_sql,
+                    parents=[source_node])
+            output[_norm(node.output_name)] = node
+            ordered_names.append(node.output_name)
 
     # --------------------------------------------------------------- conditions
     def _record_condition(self, kind: str, expression: exp.Expression,
-                          relations: list[Relation], scope_id: str,
+                          from_scope: FromScope, scope_id: str,
                           model: str, sink: list[dict]) -> None:
         for column in expression.find_all(exp.Column):
-            node = self._resolve_column(column, relations, model)
+            node = self._resolve_column(column, from_scope, model)
             chains = node.chains_to(set(self.targets))
             for chain in chains:
                 sink.append({
@@ -403,6 +525,22 @@ class Analyzer:
                     "scope": scope_id,
                     "expression": expression.sql(DIALECT),
                     "column": column.sql(DIALECT),
+                    "reference_chain": chain,
+                })
+
+    def _record_using_conditions(self, join: exp.Join,
+                                 records: list[tuple[str, ColumnNode]],
+                                 scope_id: str, sink: list[dict]) -> None:
+        """Record one JOIN USING entry per key column actually equated by this
+        clause (left result at this join step + current right table)."""
+        target_set = set(self.targets)
+        for label, node in records:
+            for chain in node.chains_to(target_set):
+                sink.append({
+                    "type": "JOIN USING",
+                    "scope": scope_id,
+                    "expression": join.sql(DIALECT),
+                    "column": label,
                     "reference_chain": chain,
                 })
 
@@ -420,14 +558,15 @@ class Analyzer:
             cte_cols.update(cte_output)
             local_cte[_norm(cte.alias)] = (cte_id, cte_cols)
 
-        relations = self._build_relations(scope_id, select, local_cte, model)
+        relations_scope, using_records = self._build_from_scope(
+            scope_id, select, local_cte, model)
         output = self._register_scope(scope_id)
         ordered_names: list[str] = []
 
         for projection in select.expressions:
             if isinstance(projection, exp.Star) or (
                 isinstance(projection, exp.Column) and projection.is_star):
-                self._expand_star(projection, relations, output, ordered_names,
+                self._expand_star(projection, relations_scope, output, ordered_names,
                                   scope_id, model)
                 continue
             if isinstance(projection, exp.Alias):
@@ -443,42 +582,35 @@ class Analyzer:
                 raise AnalysisError(
                     f"输出列 {out_name} 在同一 SELECT 中重复定义",
                     model=model, location=projection.sql(DIALECT)[:60])
-            parents = self._resolve_expression(expr, relations, model)
-            node = ColumnNode(
-                scope_id=scope_id, output_name=out_name,
-                expression_sql=expr.sql(DIALECT), parents=parents)
+            parents = self._resolve_expression(expr, relations_scope, model)
+            if (isinstance(expr, exp.Column) and len(parents) == 1
+                    and parents[0].is_join_merge
+                    and _norm(parents[0].output_name) == _norm(out_name)):
+                # bare projection of a merged FULL JOIN USING key: reuse the
+                # merged node so the chain keeps a single hop in this scope
+                node = parents[0]
+            else:
+                node = ColumnNode(
+                    scope_id=scope_id, output_name=out_name,
+                    expression_sql=expr.sql(DIALECT), parents=parents)
             output[_norm(out_name)] = node
             ordered_names.append(out_name)
 
         where = select.args.get("where")
         if where is not None:
             self._record_condition(
-                "WHERE", where.this, relations, scope_id, model, condition_sink)
-        for join in select.args.get("joins") or []:
+                "WHERE", where.this, relations_scope, scope_id, model, condition_sink)
+        for idx, join in enumerate(select.args.get("joins") or []):
             on = join.args.get("on")
             if on is not None:
                 self._record_condition(
-                    "JOIN ON", on, relations, scope_id, model, condition_sink)
-            for ident in join.args.get("using") or []:
-                # USING(col) equates col on both sides of the join; record each
-                # side that actually exposes it.
-                col_name = ident.name if isinstance(ident, exp.Identifier) else str(ident)
-                for relation in relations:
-                    node = relation.columns.get(_norm(col_name))
-                    if node is None:
-                        continue
-                    for chain in node.chains_to(set(self.targets)):
-                        condition_sink.append({
-                            "type": "JOIN USING",
-                            "scope": scope_id,
-                            "expression": join.sql(DIALECT),
-                            "column": f"{relation.display}.{col_name}",
-                            "reference_chain": chain,
-                        })
+                    "JOIN ON", on, relations_scope, scope_id, model, condition_sink)
+            self._record_using_conditions(join, using_records[idx], scope_id,
+                                          condition_sink)
         qualify = select.args.get("qualify")
         if qualify is not None:
             self._record_condition(
-                "QUALIFY", qualify.this, relations, scope_id, model, condition_sink)
+                "QUALIFY", qualify.this, relations_scope, scope_id, model, condition_sink)
         return output
 
     # ---------------------------------------------------------------------- run

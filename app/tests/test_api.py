@@ -98,3 +98,26 @@ def test_swagger_examples_present():
                ["examples"][0])
     assert example["targets"][0]["column"] == "receiver_zip_old"
     assert "/analyze" in schema["paths"]
+
+
+def test_swagger_example_consecutive_join_using_is_submittable():
+    schema = client.get("/openapi.json").json()
+    example = (schema["components"]["schemas"]["AnalyzeRequest"]
+               ["examples"][0])
+    # the built-in sample must demonstrate consecutive JOIN USING
+    fact_sql = next(m["sql"] for m in example["models"]
+                    if m["name"] == "dwd_delivery_fact")
+    assert fact_sql.count("USING") >= 2
+    resp = client.post("/analyze", json=example)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    fact = body["models"]["dwd_delivery_fact"]
+    # unqualified merged key + WHERE on it resolve through the left side
+    assert {c["type"] for c in fact["filter_conditions"]} == {"WHERE", "JOIN USING"}
+    chain = fact["dependent_output_columns"][0]["reference_chains"][0]
+    assert chain == ["dwd_delivery_fact.receiver_zip", "stg_waybill.zip",
+                     "stg_waybill.cleaned.zip", "waybills.receiver_zip_old"]
+    # the downstream model keeps the chain intact
+    ads = body["models"]["ads_zip_filtered"]
+    assert ads["dependent_output_columns"][0]["reference_chains"][0][-1] == \
+        "waybills.receiver_zip_old"
